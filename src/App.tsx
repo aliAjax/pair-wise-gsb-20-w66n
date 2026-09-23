@@ -1,160 +1,206 @@
+import { useEffect, useMemo, useState } from "react";
 import "./styles.css";
-
-const project = {
-  "id": "hxwl-06",
-  "port": 5106,
-  "title": "显微镜玻片观察",
-  "subtitle": "样本、多倍率视野与染色观察记录库",
-  "stack": "React + Vite + TypeScript + CSS",
-  "theme": [
-    "#4338ca",
-    "#0d9488",
-    "#db2777"
-  ],
-  "domain": "生物显微观察",
-  "users": [
-    "实验课教师",
-    "学生",
-    "实验管理员"
-  ],
-  "metrics": [
-    "样本数",
-    "视野记录",
-    "染色方法",
-    "重点结构"
-  ],
-  "filters": [
-    "植物组织",
-    "动物组织",
-    "微生物",
-    "血液涂片"
-  ],
-  "fields": [
-    "样本名称",
-    "样本类型",
-    "染色方式",
-    "放大倍数",
-    "观察结构",
-    "视野描述"
-  ],
-  "records": [
-    [
-      "洋葱表皮",
-      "植物组织",
-      "碘液",
-      "400x",
-      "细胞壁清晰，细胞核可见"
-    ],
-    [
-      "人血涂片",
-      "血液涂片",
-      "瑞氏染色",
-      "1000x",
-      "红细胞分布均匀"
-    ],
-    [
-      "草履虫",
-      "微生物",
-      "活体观察",
-      "200x",
-      "纤毛运动明显"
-    ]
-  ]
-};
-
-const statusColors = ["status-ok", "status-watch", "status-danger"];
-
-function MetricCard({ label, value, index }: { label: string; value: string; index: number }) {
-  return (
-    <article className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <i className={statusColors[index % statusColors.length]} />
-    </article>
-  );
-}
+import type { ClassroomSession, ObservationRecord, ReviewRequest, Role } from "./podium/types";
+import {
+  formatTime,
+  loadActiveSession,
+  loadHistory,
+  loadRecords,
+  loadRole,
+  loadStudentName,
+  saveActiveSession,
+  saveHistory,
+  saveRecords,
+  saveRole,
+  saveStudentName,
+  uid,
+} from "./podium/storage";
+import { RoleSwitch } from "./podium/RoleSwitch";
+import { RecordsLibrary } from "./podium/RecordsLibrary";
+import { SessionSetup } from "./podium/SessionSetup";
+import { Podium } from "./podium/Podium";
+import { SessionHistory } from "./podium/SessionHistory";
 
 function App() {
-  const values = project.metrics.map((metric: string, index: number) => {
-    const base = [84, 12, 31, 7][index % 4];
-    return String(base + index * 3);
-  });
+  const [records, setRecords] = useState<ObservationRecord[]>(() => loadRecords());
+  const [session, setSession] = useState<ClassroomSession | null>(() => loadActiveSession());
+  const [history, setHistory] = useState<ClassroomSession[]>(() => loadHistory());
+  const [role, setRole] = useState<Role>(() => loadRole());
+  const [studentName, setStudentName] = useState<string>(() => loadStudentName());
+
+  // 重开页面后：课堂顺序、当前位置、未处理请求全部恢复
+  useEffect(() => saveRecords(records), [records]);
+  useEffect(() => saveActiveSession(session), [session]);
+  useEffect(() => saveHistory(history), [history]);
+  useEffect(() => saveRole(role), [role]);
+  useEffect(() => saveStudentName(studentName), [studentName]);
+
+  const recordsById = useMemo(() => new Map(records.map((r) => [r.id, r])), [records]);
+
+  const readOnly = session !== null;
+
+  const addRecord = (data: Omit<ObservationRecord, "id" | "createdAt">) => {
+    if (readOnly) return; // 讲评期间记录只读
+    setRecords((prev) => [{ ...data, id: uid("rec"), createdAt: Date.now() }, ...prev]);
+  };
+
+  const createSession = (next: ClassroomSession) => setSession(next);
+
+  const patchSession = (fn: (s: ClassroomSession) => ClassroomSession) => {
+    setSession((prev) => (prev ? fn(prev) : prev));
+  };
+
+  const addRequest = (reason: string) => {
+    const request: ReviewRequest = {
+      id: uid("req"),
+      student: studentName.trim(),
+      reason,
+      createdAt: Date.now(),
+      status: "pending",
+    };
+    patchSession((s) => {
+      const items = s.items.map((it, i) =>
+        i === s.currentIndex ? { ...it, requests: [...it.requests, request] } : it
+      );
+      return { ...s, items };
+    });
+  };
+
+  const resolveRequest = (requestId: string, note: string) => {
+    patchSession((s) => {
+      const items = s.items.map((it, i) =>
+        i === s.currentIndex
+          ? {
+              ...it,
+              requests: it.requests.map((req) =>
+                req.id === requestId
+                  ? { ...req, status: "handled" as const, handledAt: Date.now(), note }
+                  : req
+              ),
+            }
+          : it
+      );
+      return { ...s, items };
+    });
+  };
+
+  const goPrev = () => {
+    patchSession((s) =>
+      s.currentIndex > 0 ? { ...s, currentIndex: s.currentIndex - 1 } : s
+    );
+  };
+
+  const goNext = () => {
+    patchSession((s) => {
+      if (s.currentIndex >= s.items.length - 1) return s;
+      const pending = s.items[s.currentIndex].requests.some((r) => r.status === "pending");
+      if (pending) return s; // 未处理请求没清完，不许切下一条
+      return { ...s, currentIndex: s.currentIndex + 1 };
+    });
+  };
+
+  const jumpBack = (index: number) => {
+    patchSession((s) => (index < s.currentIndex ? { ...s, currentIndex: index } : s));
+  };
+
+  const endSession = (reason: string) => {
+    if (!session || !reason.trim()) return;
+    const ended: ClassroomSession = {
+      ...session,
+      status: "ended",
+      endedAt: Date.now(),
+      endReason: reason.trim(),
+    };
+    setHistory((prev) => [ended, ...prev]);
+    setSession(null); // 结束后记录恢复可更正；下一次课堂用新内容创建
+  };
+
+  const totalRequests = useMemo(() => {
+    if (!session) {
+      return history.reduce(
+        (sum, s) => sum + s.items.reduce((n, it) => n + it.requests.length, 0),
+        0
+      );
+    }
+    return session.items.reduce((n, it) => n + it.requests.length, 0);
+  }, [session, history]);
 
   return (
     <main className="app-shell">
       <section className="hero">
         <div>
-          <p className="eyebrow">{project.id} · port {project.port}</p>
-          <h1>{project.title}</h1>
-          <p className="subtitle">{project.subtitle}</p>
+          <p className="eyebrow">hxwl-06 · port 5106</p>
+          <h1>显微镜玻片观察 · 课堂讲评台</h1>
+          <p className="subtitle">
+            创建一次课堂，从已有观察记录中挑样本并排好展示顺序；投屏时突出当前样本、倍率与结论。
+            学生可对当前样本发复看请求，未处理的请求跟着原样本保留，老师处理完才能切下一条。
+          </p>
         </div>
         <div className="stack-card">
-          <span>技术栈</span>
-          <strong>{project.stack}</strong>
+          <RoleSwitch role={role} onChange={setRole} />
+          <span className="hint-text">
+            讲评中记录只读；确需更正请结束课堂并填写原因。
+          </span>
         </div>
       </section>
 
       <section className="metrics-grid">
-        {project.metrics.map((metric: string, index: number) => (
-          <MetricCard key={metric} label={metric} value={values[index]} index={index} />
-        ))}
+        <article className="metric-card">
+          <span>观察记录</span>
+          <strong>{records.length}</strong>
+          <i className="status-ok" />
+        </article>
+        <article className="metric-card">
+          <span>本次讲评样本</span>
+          <strong>{session ? session.items.length : 0}</strong>
+          <i className="status-watch" />
+        </article>
+        <article className="metric-card">
+          <span>未处理复看</span>
+          <strong>
+            {session
+              ? session.items.reduce(
+                  (n, it) => n + it.requests.filter((r) => r.status === "pending").length,
+                  0
+                )
+              : 0}
+          </strong>
+          <i className="status-danger" />
+        </article>
+        <article className="metric-card">
+          <span>累计复看请求</span>
+          <strong>{totalRequests}</strong>
+          <i className="status-ok" />
+        </article>
       </section>
 
-      <section className="workspace">
-        <aside className="panel narrow">
-          <h2>角色</h2>
-          <div className="chips">
-            {project.users.map((user: string) => (
-              <span key={user}>{user}</span>
-            ))}
-          </div>
-          <h2>筛选</h2>
-          <div className="chips muted">
-            {project.filters.map((filter: string) => (
-              <button key={filter}>{filter}</button>
-            ))}
-          </div>
-        </aside>
-
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <p>{project.domain}</p>
-              <h2>记录字段</h2>
-            </div>
-            <button className="primary-action">新增记录</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
-        </section>
-      </section>
-
-      <section className="records panel">
-        <div className="section-heading">
-          <div>
-            <p>示例数据</p>
-            <h2>近期记录</h2>
-          </div>
-          <button>导出摘要</button>
+      {readOnly && (
+        <div className="readonly-strip">
+          🔒 课堂「{session!.name}」讲评中（{formatTime(session!.createdAt)} 开始）——全部观察记录只读
         </div>
-        <div className="record-list">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")} className="record-card">
-              <div className="record-index">{String(index + 1).padStart(2, "0")}</div>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
+      )}
+
+      {session ? (
+        <Podium
+          session={session}
+          recordsById={recordsById}
+          role={role}
+          studentName={studentName}
+          onStudentNameChange={setStudentName}
+          onAddRequest={addRequest}
+          onResolveRequest={resolveRequest}
+          onPrev={goPrev}
+          onNext={goNext}
+          onJumpBack={jumpBack}
+          onEnd={endSession}
+        />
+      ) : (
+        <SessionSetup records={records} onCreate={createSession} />
+      )}
+
+      <RecordsLibrary records={records} readOnly={readOnly} onAdd={addRecord} />
+
+      <SessionHistory sessions={history} recordsById={recordsById} />
     </main>
   );
 }
