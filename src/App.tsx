@@ -1,92 +1,189 @@
+import { useEffect, useMemo, useState } from "react";
 import "./styles.css";
+import type {
+  ClassroomSession,
+  ObservationRecord,
+  ReviewRequest,
+  SessionEndKind,
+} from "./types";
+import {
+  loadActiveSessionId,
+  loadRecords,
+  loadRequests,
+  loadSessions,
+  makeId,
+  saveActiveSessionId,
+  saveRecords,
+  saveRequests,
+  saveSessions,
+} from "./storage";
+import { RecordPanel } from "./components/RecordPanel";
+import { SetupView } from "./components/SetupView";
+import { PodiumView } from "./components/PodiumView";
 
 const project = {
-  "id": "hxwl-06",
-  "port": 5106,
-  "title": "显微镜玻片观察",
-  "subtitle": "样本、多倍率视野与染色观察记录库",
-  "stack": "React + Vite + TypeScript + CSS",
-  "theme": [
-    "#4338ca",
-    "#0d9488",
-    "#db2777"
-  ],
-  "domain": "生物显微观察",
-  "users": [
-    "实验课教师",
-    "学生",
-    "实验管理员"
-  ],
-  "metrics": [
-    "样本数",
-    "视野记录",
-    "染色方法",
-    "重点结构"
-  ],
-  "filters": [
-    "植物组织",
-    "动物组织",
-    "微生物",
-    "血液涂片"
-  ],
-  "fields": [
-    "样本名称",
-    "样本类型",
-    "染色方式",
-    "放大倍数",
-    "观察结构",
-    "视野描述"
-  ],
-  "records": [
-    [
-      "洋葱表皮",
-      "植物组织",
-      "碘液",
-      "400x",
-      "细胞壁清晰，细胞核可见"
-    ],
-    [
-      "人血涂片",
-      "血液涂片",
-      "瑞氏染色",
-      "1000x",
-      "红细胞分布均匀"
-    ],
-    [
-      "草履虫",
-      "微生物",
-      "活体观察",
-      "200x",
-      "纤毛运动明显"
-    ]
-  ]
+  id: "hxwl-06",
+  port: 5106,
+  title: "显微镜玻片观察 · 课堂讲评台",
+  subtitle: "挑样本、排顺序，投屏逐条讲评；学生复看请求随原样本保留，顺序与请求重开页面不丢失。",
+  stack: "React + Vite + TypeScript + CSS（localStorage 持久化）",
 };
 
-const statusColors = ["status-ok", "status-watch", "status-danger"];
-
-function MetricCard({ label, value, index }: { label: string; value: string; index: number }) {
-  return (
-    <article className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <i className={statusColors[index % statusColors.length]} />
-    </article>
-  );
-}
-
 function App() {
-  const values = project.metrics.map((metric: string, index: number) => {
-    const base = [84, 12, 31, 7][index % 4];
-    return String(base + index * 3);
-  });
+  const [records, setRecords] = useState<ObservationRecord[]>(loadRecords);
+  const [sessions, setSessions] = useState<ClassroomSession[]>(loadSessions);
+  const [requests, setRequests] = useState<ReviewRequest[]>(loadRequests);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(
+    loadActiveSessionId
+  );
+
+  useEffect(() => saveRecords(records), [records]);
+  useEffect(() => saveSessions(sessions), [sessions]);
+  useEffect(() => saveRequests(requests), [requests]);
+  useEffect(() => saveActiveSessionId(activeSessionId), [activeSessionId]);
+
+  // 重开页面后，恢复未结束的课堂（顺序、当前位置、未处理请求一并保留）
+  const activeSession = useMemo(
+    () =>
+      sessions.find(
+        (s) => s.id === activeSessionId && s.status === "active"
+      ) ?? null,
+    [sessions, activeSessionId]
+  );
+
+  const pendingTotal = useMemo(
+    () =>
+      activeSession
+        ? requests.filter(
+            (r) =>
+              r.sessionId === activeSession.id && r.status === "pending"
+          ).length
+        : 0,
+    [requests, activeSession]
+  );
+
+  const queuedCount = activeSession?.queue.length ?? 0;
+  const reviewedCount = activeSession ? activeSession.currentIndex : 0;
+  const endedCount = sessions.filter((s) => s.status === "ended").length;
+
+  // ---- 记录库 ----
+  const saveRecord = (record: ObservationRecord) => {
+    setRecords((prev) => {
+      const exists = prev.some((r) => r.id === record.id);
+      return exists
+        ? prev.map((r) => (r.id === record.id ? record : r))
+        : [...prev, record];
+    });
+  };
+
+  // ---- 开课 ----
+  const createSession = (name: string, orderedRecordIds: string[]) => {
+    const session: ClassroomSession = {
+      id: makeId("ses"),
+      name,
+      createdAt: Date.now(),
+      status: "active",
+      currentIndex: 0,
+      queue: orderedRecordIds.map((recordId) => ({ recordId })),
+    };
+    setSessions((prev) => [...prev, session]);
+    setActiveSessionId(session.id);
+  };
+
+  // ---- 讲评导航 ----
+  const updateActiveSession = (
+    patch: Partial<ClassroomSession>
+  ) => {
+    if (!activeSession) return;
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.id === activeSession.id ? { ...s, ...patch } : s
+      )
+    );
+  };
+
+  const moveTo = (delta: number) => {
+    if (!activeSession) return;
+    const target = activeSession.currentIndex + delta;
+    if (target < 0 || target >= activeSession.queue.length) return;
+    updateActiveSession({ currentIndex: target });
+  };
+
+  const jumpTo = (index: number) => {
+    if (!activeSession) return;
+    if (index < 0 || index >= activeSession.queue.length) return;
+    updateActiveSession({ currentIndex: index });
+  };
+
+  // ---- 复看请求：跟随原样本（recordId）保留 ----
+  const createRequest = (studentName: string, note: string) => {
+    if (!activeSession) return;
+    const entry = activeSession.queue[activeSession.currentIndex];
+    const req: ReviewRequest = {
+      id: makeId("req"),
+      sessionId: activeSession.id,
+      recordId: entry.recordId,
+      studentName,
+      note,
+      createdAt: Date.now(),
+      status: "pending",
+    };
+    setRequests((prev) => [...prev, req]);
+  };
+
+  const handleRequest = (
+    requestId: string,
+    status: "accepted" | "rejected"
+  ) => {
+    setRequests((prev) =>
+      prev.map((r) =>
+        r.id === requestId
+          ? { ...r, status, handledAt: Date.now() }
+          : r
+      )
+    );
+  };
+
+  // ---- 结束课堂 ----
+  const endSession = (kind: SessionEndKind, reason: string) => {
+    if (!activeSession) return;
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.id === activeSession.id
+          ? {
+              ...s,
+              status: "ended",
+              endedAt: Date.now(),
+              endKind: kind,
+              endReason: reason || undefined,
+            }
+          : s
+      )
+    );
+    // 未处理请求不删除：已按 recordId 持久化，历史课堂中仍跟随原样本可查
+    setActiveSessionId(null);
+  };
+
+  const metrics = [
+    { label: "记录样本数", value: String(records.length) },
+    { label: "本次已讲评", value: activeSession ? `${reviewedCount}/${queuedCount}` : "—" },
+    { label: "未处理复看请求", value: activeSession ? String(pendingTotal) : "—" },
+    { label: "历史课堂", value: String(endedCount) },
+  ];
+  const statusColors = ["status-ok", "status-watch", "status-danger"];
 
   return (
-    <main className="app-shell">
+    <main className={"app-shell" + (activeSession ? " in-session" : "")}>
       <section className="hero">
         <div>
           <p className="eyebrow">{project.id} · port {project.port}</p>
           <h1>{project.title}</h1>
           <p className="subtitle">{project.subtitle}</p>
+          {activeSession && (
+            <span className="session-pill">
+              讲评进行中：{activeSession.name} · 记录只读
+            </span>
+          )}
         </div>
         <div className="stack-card">
           <span>技术栈</span>
@@ -95,66 +192,43 @@ function App() {
       </section>
 
       <section className="metrics-grid">
-        {project.metrics.map((metric: string, index: number) => (
-          <MetricCard key={metric} label={metric} value={values[index]} index={index} />
+        {metrics.map((metric, index) => (
+          <article className="metric-card" key={metric.label}>
+            <span>{metric.label}</span>
+            <strong>{metric.value}</strong>
+            <i className={statusColors[index % statusColors.length]} />
+          </article>
         ))}
       </section>
 
-      <section className="workspace">
-        <aside className="panel narrow">
-          <h2>角色</h2>
-          <div className="chips">
-            {project.users.map((user: string) => (
-              <span key={user}>{user}</span>
-            ))}
-          </div>
-          <h2>筛选</h2>
-          <div className="chips muted">
-            {project.filters.map((filter: string) => (
-              <button key={filter}>{filter}</button>
-            ))}
-          </div>
-        </aside>
+      {activeSession ? (
+        <PodiumView
+          session={activeSession}
+          records={records}
+          requests={requests.filter((r) => r.sessionId === activeSession.id)}
+          onMove={moveTo}
+          onJump={jumpTo}
+          onCreateRequest={createRequest}
+          onHandleRequest={handleRequest}
+          onEnd={endSession}
+        />
+      ) : (
+        <SetupView
+          records={records}
+          sessions={sessions}
+          onCreate={createSession}
+        />
+      )}
 
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <p>{project.domain}</p>
-              <h2>记录字段</h2>
-            </div>
-            <button className="primary-action">新增记录</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
-        </section>
-      </section>
+      <RecordPanel
+        records={records}
+        readOnly={Boolean(activeSession)}
+        onSave={saveRecord}
+      />
 
-      <section className="records panel">
-        <div className="section-heading">
-          <div>
-            <p>示例数据</p>
-            <h2>近期记录</h2>
-          </div>
-          <button>导出摘要</button>
-        </div>
-        <div className="record-list">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")} className="record-card">
-              <div className="record-index">{String(index + 1).padStart(2, "0")}</div>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
+      <footer className="app-footer">
+        课堂顺序、讲评位置与复看请求保存在本机浏览器，重开页面自动恢复；讲评结束后记录库解除只读。
+      </footer>
     </main>
   );
 }
